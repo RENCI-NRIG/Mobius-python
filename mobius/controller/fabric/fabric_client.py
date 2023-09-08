@@ -26,7 +26,8 @@ import logging
 import traceback
 from typing import List
 
-from fabrictestbed_extensions.fablib.fablib import fablib
+from fabrictestbed.slice_editor import ServiceType
+from fabrictestbed_extensions.fablib.fablib import FablibManager
 from fabrictestbed_extensions.fablib.resources import Resources
 from fabrictestbed_extensions.fablib.slice import Slice
 
@@ -42,6 +43,12 @@ class FabricClient(ApiClient):
         self.runtime_config = runtime_config
         self.node_counter = 0
         self.slices = {}
+        self.fablib = FablibManager(credmgr_host=self.fabric_config.get(Config.FABRIC_CM_HOST),
+                                    orchestrator_host=self.fabric_config.get(Config.FABRIC_OC_HOST),
+                                    fabric_token=self.fabric_config.get(Config.FABRIC_TOKEN_LOCATION),
+                                    project_id=self.fabric_config.get(Config.FABRIC_PROJECT_ID),
+                                    bastion_username=self.fabric_config.get(Config.FABRIC_BASTION_USER_NAME),
+                                    bastion_key_filename=self.fabric_config.get(Config.FABRIC_BASTION_KEY_LOCATION))
 
     def get_resources(self, slice_id: str = None, slice_name: str = None) -> List[Slice] or None:
         if slice_id is None and slice_name is None and len(self.slices) == 0:
@@ -51,10 +58,10 @@ class FabricClient(ApiClient):
             self.logger.info("get slice_id")
             if slice_id is not None:
                 self.logger.info("slice_id: " + str(slice_id))
-                result.append(fablib.get_slice(slice_id=slice_id))
+                result.append(self.fablib.get_slice(slice_id=slice_id))
             elif slice_name is not None:
                 self.logger.info("slice id is none. slice name: " + slice_name)
-                result.append(fablib.get_slice(name=slice_name))
+                result.append(self.fablib.get_slice(name=slice_name))
             else:
                 result = self.slices.values()
             return result
@@ -63,7 +70,7 @@ class FabricClient(ApiClient):
 
     def get_available_resources(self) -> Resources:
         try:
-            available_resources = fablib.get_available_resources()
+            available_resources = self.fablib.get_available_resources()
             self.logger.info(f"Available Resources: {available_resources}")
             return available_resources
         except Exception as e:
@@ -78,7 +85,7 @@ class FabricClient(ApiClient):
             self.logger.info(f"Slice {slice_name} already exists!")
             return None
         self.logger.debug(f"Adding {resource} to {slice_name}")
-        slice_object = fablib.new_slice(slice_name)
+        slice_object = self.fablib.new_slice(slice_name)
 
         interface_list = []
         node_count = resource.get(Config.RES_COUNT)
@@ -90,8 +97,9 @@ class FabricClient(ApiClient):
         cores = resource.get(Config.RES_FLAVOR)[Config.RES_FLAVOR_CORES]
         ram = resource.get(Config.RES_FLAVOR)[Config.RES_FLAVOR_RAM]
         disk = resource.get(Config.RES_FLAVOR)[Config.RES_FLAVOR_DISK]
+
         if site == Config.FABRIC_RANDOM:
-            site = fablib.get_random_site()
+            site = self.fablib.get_random_site()
 
         # Add node
         for i in range(node_count):
@@ -113,22 +121,43 @@ class FabricClient(ApiClient):
         try:
             if slice_object is None:
                 raise Exception("Add Resources to the Slice, before requesting external access")
+            self.logger.info("Requesting external access")
 
-            slice_object = fablib.get_slice(slice_id=slice_object.slice_id)
+            slice_object = self.fablib.get_slice(name=slice_object.slice_name)
 
-            for n in slice_object.get_networks():
-                available_ips = n.get_available_ips()
-                if n.get_type() == "FABNetv4Ext":
-                    n.make_ip_publicly_routable(ipv4=[str(available_ips[0])])
-                elif n.get_type() == "FABNetv6Ext":
-                    n.make_ip_publicly_routable(ipv6=[str(available_ips[0])])
+            num_nodes = len(slice_object.get_nodes())
+            network = slice_object.get_networks()[0]
+            available_ips = network.get_available_ips(count=num_nodes)
+            available_ips_str = []
+            for x in available_ips:
+                available_ips_str.append(str(x))
 
-            self.submit_and_wait(slice_object=slice_object)
-            return slice_object.slice_id
+            self.logger.info(f"Requesting public access on IPs: {available_ips_str} for {network.get_type()}")
+            if network.get_type() == ServiceType.FABNetv4Ext:
+                network.make_ip_publicly_routable(ipv4=available_ips_str)
+            elif network.get_type() == ServiceType.FABNetv6Ext:
+                network.make_ip_publicly_routable(ipv6=available_ips_str)
+
+            self.logger.info("Submitted external access request")
+            slice_object.submit()
+            slice_object = self.fablib.get_slice(slice_id=slice_object.slice_id)
+
+            network = slice_object.get_networks()[0]
+            public_ips = network.get_public_ips()
+            count = 0
+            for n in slice_object.get_nodes():
+                node_iface = n.get_interface(network_name=network.get_name())
+                node_iface.ip_addr_add(addr=public_ips[count], subnet=network.get_subnet())
+                if network.get_type() == "FABNetv4Ext":
+                    n.execute(f'sudo ip route add 0.0.0.0/1 via {network.get_gateway()} dev {node_iface.get_device_name()}')
+                elif network.get_type() == "FABNetv6Ext":
+                    n.execute(
+                        f'sudo ip route add 2605:d9c0:2:10::2:210/64 via {network.get_gateway()} dev {node_iface.get_device_name()}')
+                self.logger.info(f"IP Address {public_ips[count]} and routes configured on  {n.get_name()}/{n.get_management_ip()}!")
+                count += 1
         except Exception as e:
             self.logger.error(f"Exception occurred: {e}")
             self.logger.error(traceback.format_exc())
-        return None
 
     def submit_and_wait(self, *, slice_object: Slice) -> str or None:
         try:
@@ -143,13 +172,9 @@ class FabricClient(ApiClient):
 
             # Check if the slice has more than one site then add a layer2 network
             # Submit Slice Request
-            self.logger.debug("Submit slice request")
-            slice_id = slice_object.submit(wait=False)
-            self.logger.debug("Waiting for the slice to Stable")
-            slice_object.wait(progress=True)
-            slice_object.update()
-            slice_object.post_boot_config()
-            self.logger.debug("Slice provisioning successful")
+            self.logger.info("Submit slice request")
+            slice_id = slice_object.submit()
+            self.logger.info("Slice provisioning successful")
             return slice_id
         except Exception as e:
             self.logger.error(f"Exception occurred: {e}")
@@ -161,10 +186,10 @@ class FabricClient(ApiClient):
             return None
         try:
             if slice_id is not None:
-                slice_object = fablib.get_slice(slice_id=slice_id)
+                slice_object = self.fablib.get_slice(slice_id=slice_id)
                 slice_object.delete()
             elif slice_name is not None:
-                slice_object = fablib.get_slice(slice_name)
+                slice_object = self.fablib.get_slice(slice_name)
                 slice_object.delete()
             else:
                 for s in self.slices.values():

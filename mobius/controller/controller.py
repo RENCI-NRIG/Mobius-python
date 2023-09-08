@@ -40,12 +40,12 @@ class Controller:
         log_level = log_config.get(Config.PROPERTY_CONF_LOG_LEVEL, logging.INFO)
 
         self.logger.setLevel(log_level)
+
         file_handler = RotatingFileHandler(log_config.get(Config.PROPERTY_CONF_LOG_FILE),
                                            backupCount=int(log_config.get(Config.PROPERTY_CONF_LOG_RETAIN)),
                                            maxBytes=int(log_config.get(Config.PROPERTY_CONF_LOG_SIZE)))
-        logging.basicConfig(level=log_level,
-                            format="%(asctime)s [%(filename)s:%(lineno)d] [%(levelname)s] %(message)s",
-                            handlers=[logging.StreamHandler(), file_handler], force=True)
+        file_handler.setFormatter(logging.Formatter("%(asctime)s [%(filename)s:%(lineno)d] [%(levelname)s] %(message)s"))
+        self.logger.addHandler(file_handler)
 
         self.fabric_client = None
         self.chi_client = None
@@ -53,9 +53,8 @@ class Controller:
         runtime_config = self.config.get_runtime_config()
         fabric_config = self.config.get_fabric_config()
         if fabric_config is not None:
-            self.__setup_fabric(fabric_config=fabric_config, runtime_config=runtime_config)
             from mobius.controller.fabric.fabric_client import FabricClient
-            self.fabric_client = FabricClient(logger=self.logger, fabric_config=runtime_config,
+            self.fabric_client = FabricClient(logger=self.logger, fabric_config=fabric_config,
                                               runtime_config=runtime_config)
 
         chi_config = self.config.get_chi_config()
@@ -111,6 +110,7 @@ class Controller:
                 self.fabric_client.submit_and_wait(slice_object=fabric_slice)
                 self.fabric_client.request_external_access(slice_object=fabric_slice)
         except Exception as e:
+            traceback.print_exception(e)
             self.logger.error(f"Exception occurred while creating resources: {e}")
             self.logger.error(traceback.format_exc())
 
