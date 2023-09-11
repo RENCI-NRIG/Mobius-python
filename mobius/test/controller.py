@@ -36,6 +36,7 @@ if __name__ == "__main__":
         print(r.list_nodes())
         for n in r.get_nodes():
             print(n)
+            print(f"External IP for node: {n.get_name()} => {n.get_external_ip()}")
 
     print("Sleeping for 10 seconds")
     time.sleep(10)

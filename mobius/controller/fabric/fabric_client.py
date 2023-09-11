@@ -24,10 +24,12 @@
 # Author Komal Thareja (kthare10@renci.org)
 import logging
 import traceback
+from ipaddress import IPv4Network
 from typing import List
 
 from fabrictestbed.slice_editor import ServiceType
 from fabrictestbed_extensions.fablib.fablib import FablibManager
+from fabrictestbed_extensions.fablib.node import Node
 from fabrictestbed_extensions.fablib.resources import Resources
 from fabrictestbed_extensions.fablib.slice import Slice
 
@@ -35,7 +37,16 @@ from mobius.controller.api.api_client import ApiClient
 from mobius.controller.util.config import Config
 
 
+def get_external_ip(self):
+    site = self.get_site()
+    interface = self.get_interface(network_name=f"{site}-EXT")
+    return interface.get_ip_addr()
+
+
 class FabricClient(ApiClient):
+    n = Node
+    n.get_external_ip = get_external_ip
+
     def __init__(self, *, logger: logging.Logger, fabric_config: dict, runtime_config: dict):
         """ Constructor """
         self.logger = logger
@@ -87,12 +98,14 @@ class FabricClient(ApiClient):
         self.logger.debug(f"Adding {resource} to {slice_name}")
         slice_object = self.fablib.new_slice(slice_name)
 
-        interface_list = []
         node_count = resource.get(Config.RES_COUNT)
         node_name_prefix = resource.get(Config.RES_NAME_PREFIX)
         image = resource.get(Config.RES_IMAGE)
         nic_model = resource.get(Config.RES_NIC_MODEL)
         network_type = resource.get(Config.RES_NETWORK)[Config.RES_TYPE]
+        local_subnet = resource.get(Config.RES_NETWORK)[Config.RES_LOCAL_NW_SUBNET]
+        if local_subnet is None:
+            local_subnet = "192.168.1.0/24"
         site = resource.get(Config.RES_SITE)
         cores = resource.get(Config.RES_FLAVOR)[Config.RES_FLAVOR_CORES]
         ram = resource.get(Config.RES_FLAVOR)[Config.RES_FLAVOR_RAM]
@@ -101,18 +114,24 @@ class FabricClient(ApiClient):
         if site == Config.FABRIC_RANDOM:
             site = self.fablib.get_random_site()
 
+        # Layer3 Network (provides data plane internet access)
+        net1 = slice_object.add_l3network(name=f"{site}-EXT", type=f"{network_type}Ext")
+
+        # Layer2 Network
+        net2 = slice_object.add_l2network(name=f"{site}-LOCAL", subnet=IPv4Network(local_subnet))
+
         # Add node
         for i in range(node_count):
             node_name = f"{node_name_prefix}{self.node_counter}"
             self.node_counter += 1
             node = slice_object.add_node(name=node_name, image=image, site=site, cores=cores, ram=ram, disk=disk)
 
-            iface = node.add_component(model=nic_model, name=f"{node_name}-nic1").get_interfaces()[0]
-            interface_list.append(iface)
+            iface1 = node.add_component(model=nic_model, name=f"{node_name}-ext").get_interfaces()[0]
+            net1.add_interface(iface1)
 
-        # Layer3 Network (provides data plane internet access)
-        net1 = slice_object.add_l3network(name=f"{site}-network", interfaces=interface_list,
-                                               type=f"{network_type}Ext")
+            iface2 = node.add_component(model=nic_model, name=f"{node_name}-local").get_interfaces()[0]
+            iface2.set_mode('auto')
+            net2.add_interface(iface2)
 
         self.slices[slice_name] = slice_object
         return slice_object
@@ -126,33 +145,34 @@ class FabricClient(ApiClient):
             slice_object = self.fablib.get_slice(name=slice_object.slice_name)
 
             num_nodes = len(slice_object.get_nodes())
-            network = slice_object.get_networks()[0]
-            available_ips = network.get_available_ips(count=num_nodes)
+            site = slice_object.get_nodes()[0].get_site()
+            ext_network = slice_object.get_network(name=f"{site}-EXT")
+            available_ips = ext_network.get_available_ips(count=num_nodes)
             available_ips_str = []
             for x in available_ips:
                 available_ips_str.append(str(x))
 
-            self.logger.info(f"Requesting public access on IPs: {available_ips_str} for {network.get_type()}")
-            if network.get_type() == ServiceType.FABNetv4Ext:
-                network.make_ip_publicly_routable(ipv4=available_ips_str)
-            elif network.get_type() == ServiceType.FABNetv6Ext:
-                network.make_ip_publicly_routable(ipv6=available_ips_str)
+            self.logger.info(f"Requesting public access on IPs: {available_ips_str} for {ext_network.get_type()}")
+            if ext_network.get_type() == ServiceType.FABNetv4Ext:
+                ext_network.make_ip_publicly_routable(ipv4=available_ips_str)
+            elif ext_network.get_type() == ServiceType.FABNetv6Ext:
+                ext_network.make_ip_publicly_routable(ipv6=available_ips_str)
 
             self.logger.info("Submitted external access request")
             slice_object.submit()
             slice_object = self.fablib.get_slice(slice_id=slice_object.slice_id)
 
-            network = slice_object.get_networks()[0]
-            public_ips = network.get_public_ips()
+            ext_network = slice_object.get_network(name=f"{site}-EXT")
+            public_ips = ext_network.get_public_ips()
             count = 0
             for n in slice_object.get_nodes():
-                node_iface = n.get_interface(network_name=network.get_name())
-                node_iface.ip_addr_add(addr=public_ips[count], subnet=network.get_subnet())
-                if network.get_type() == "FABNetv4Ext":
-                    n.execute(f'sudo ip route add 0.0.0.0/1 via {network.get_gateway()} dev {node_iface.get_device_name()}')
-                elif network.get_type() == "FABNetv6Ext":
+                node_iface = n.get_interface(network_name=ext_network.get_name())
+                node_iface.ip_addr_add(addr=public_ips[count], subnet=ext_network.get_subnet())
+                if ext_network.get_type() == ServiceType.FABNetv4Ext:
+                    n.execute(f'sudo ip route add 0.0.0.0/1 via {ext_network.get_gateway()} dev {node_iface.get_device_name()}')
+                elif ext_network.get_type() == ServiceType.FABNetv6Ext:
                     n.execute(
-                        f'sudo ip route add 2605:d9c0:2:10::2:210/64 via {network.get_gateway()} dev {node_iface.get_device_name()}')
+                        f'sudo ip route add 2605:d9c0:2:10::2:210/64 via {ext_network.get_gateway()} dev {node_iface.get_device_name()}')
                 self.logger.info(f"IP Address {public_ips[count]} and routes configured on  {n.get_name()}/{n.get_management_ip()}!")
                 count += 1
         except Exception as e:

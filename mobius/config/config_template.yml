@@ -43,7 +43,8 @@ resources:
         nic_model: NIC_Basic # NIC_Basic(SRIOV), NIC_ConnectX_5 => 25GB, NIC_ConnectX_6 => 100GB
         name_prefix: node
         network:
-          type: IPv6 # Allowed values IPv4 or IPv6
+          ext_nw_type: IPv6 # Allowed values IPv4 or IPv6
+          local_nw_subnet: "192.168.1.0/24"
         flavor:
           cores: 2
           ram: 8

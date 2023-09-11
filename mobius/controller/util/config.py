@@ -72,6 +72,7 @@ class Config:
     RES_FLAVOR_RAM = "ram"
     RES_FLAVOR_DISK = "disk"
     RES_FLAVOR_NAME = "name"
+    RES_LOCAL_NW_SUBNET = "local_nw_subnet"
 
     LOGGING = "logging"
     PROPERTY_CONF_LOG_FILE = 'log-file'
